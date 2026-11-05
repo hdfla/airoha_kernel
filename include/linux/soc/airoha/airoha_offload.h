@@ -6,6 +6,7 @@
 #ifndef AIROHA_OFFLOAD_H
 #define AIROHA_OFFLOAD_H
 
+#include <linux/err.h>
 #include <linux/io.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
@@ -171,6 +172,15 @@ enum airoha_npu_version {
 	NPU_V2_P,   /* AN7583 */
 };
 
+enum airoha_npu_wlan_chip {
+	AIROHA_NPU_WLAN_NONE,
+	AIROHA_NPU_WLAN_MT7915,
+	AIROHA_NPU_WLAN_MT7916,
+	AIROHA_NPU_WLAN_MT7996,
+	AIROHA_NPU_WLAN_MT7992,
+	AIROHA_NPU_WLAN_MT7990,
+};
+
 enum airoha_npu_wlan_set_cmd {
 	WLAN_FUNC_SET_WAIT_PCIE_ADDR,
 	WLAN_FUNC_SET_WAIT_DESC,
@@ -206,6 +216,8 @@ enum airoha_npu_wlan_set_cmd {
 	WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO,
 	WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR,
 	WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE,
+
+	WLAN_FUNC_SET_WAIT_DRAM_BA_ENTRY_ADDR,
 
 	WLAN_FUNC_SET_WAIT_MAX,
 };
@@ -280,8 +292,12 @@ struct airoha_npu {
 };
 
 #if (IS_BUILTIN(CONFIG_NET_AIROHA_NPU) || IS_MODULE(CONFIG_NET_AIROHA_NPU))
+/* Mark Ethernet datapath readiness; does not load or boot firmware. */
 int airoha_npu_start(struct device *dev);
 struct airoha_npu *airoha_npu_get(struct device *dev);
+/* Sleepable: acquire the provider and boot the requested WLAN firmware once. */
+struct airoha_npu *
+airoha_npu_wlan_get(struct device *dev, enum airoha_npu_wlan_chip chip);
 void airoha_npu_put(struct airoha_npu *npu);
 
 static inline bool airoha_npu_wlan_has_cmd(struct airoha_npu *npu, bool set,
@@ -340,6 +356,12 @@ static inline void airoha_npu_wlan_disable_irq(struct airoha_npu *npu, int q)
 static inline int airoha_npu_start(struct device *dev)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline struct airoha_npu *
+airoha_npu_wlan_get(struct device *dev, enum airoha_npu_wlan_chip chip)
+{
+	return ERR_PTR(-EOPNOTSUPP);
 }
 
 static inline struct airoha_npu *airoha_npu_get(struct device *dev)

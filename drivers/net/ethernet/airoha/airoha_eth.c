@@ -11639,6 +11639,8 @@ static int airoha_eth_probe(struct platform_device *pdev)
 		goto error;
 
 	err = airoha_npu_start(eth->dev);
+	if (err == -EPROBE_DEFER)
+		goto error;
 	if (err && err != -ENODEV && err != -EPROBE_DEFER &&
 	    err != -EOPNOTSUPP)
 		dev_warn(eth->dev, "failed to start NPU: %d\n", err);
