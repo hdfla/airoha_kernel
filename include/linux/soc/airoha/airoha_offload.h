@@ -271,6 +271,8 @@ struct airoha_npu {
 		u32 (*wlan_get_irq_status)(struct airoha_npu *npu, int q);
 		void (*wlan_enable_irq)(struct airoha_npu *npu, int q);
 		void (*wlan_disable_irq)(struct airoha_npu *npu, int q);
+		bool (*wlan_has_cmd)(struct airoha_npu *npu, bool set,
+				     unsigned int cmd);
 	} ops;
 #endif
 };
@@ -279,6 +281,12 @@ struct airoha_npu {
 int airoha_npu_start(struct device *dev);
 struct airoha_npu *airoha_npu_get(struct device *dev);
 void airoha_npu_put(struct airoha_npu *npu);
+
+static inline bool airoha_npu_wlan_has_cmd(struct airoha_npu *npu, bool set,
+					 unsigned int cmd)
+{
+	return npu->ops.wlan_has_cmd && npu->ops.wlan_has_cmd(npu, set, cmd);
+}
 
 static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)
 {
@@ -339,6 +347,12 @@ static inline struct airoha_npu *airoha_npu_get(struct device *dev)
 
 static inline void airoha_npu_put(struct airoha_npu *npu)
 {
+}
+
+static inline bool airoha_npu_wlan_has_cmd(struct airoha_npu *npu, bool set,
+					 unsigned int cmd)
+{
+	return false;
 }
 
 static inline int airoha_npu_wlan_init_reserved_memory(struct airoha_npu *npu)

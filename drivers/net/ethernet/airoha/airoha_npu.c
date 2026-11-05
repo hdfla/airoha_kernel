@@ -399,7 +399,7 @@ airoha_npu_load_firmware_from_dts(struct device *dev, void __iomem *addr,
 }
 
 static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
-				   void __iomem *fw_addr)
+				   void __iomem *fw_addr, size_t fw_size)
 {
 	const struct airoha_npu_soc_data *soc;
 	int ret;
@@ -407,6 +407,10 @@ static int airoha_npu_run_firmware(struct device *dev, void __iomem *base,
 	soc = of_device_get_match_data(dev);
 	if (!soc)
 		return -EINVAL;
+
+	if (fw_size <= soc->fw_rv32.max_size)
+		return dev_err_probe(dev, -EINVAL,
+				     "firmware region must include NPU workspace\n");
 
 	/* Try to load firmware images using the firmware names provided via
 	 * dts if available.
@@ -630,6 +634,17 @@ out:
 	return err;
 }
 
+static bool airoha_npu_wlan_cmd_supported(struct airoha_npu *npu, bool set,
+					  unsigned int cmd)
+{
+	if (set)
+		return cmd < WLAN_FUNC_SET_WAIT_MAX &&
+		       npu->soc_data->wlan_func_set[cmd] != WLAN_FUNC_SET_WAIT_MAX;
+
+	return cmd < WLAN_FUNC_GET_WAIT_MAX &&
+	       npu->soc_data->wlan_func_get[cmd] != WLAN_FUNC_GET_WAIT_MAX;
+}
+
 static int airoha_npu_wlan_msg_send(struct airoha_npu *npu, int ifindex,
 				    enum airoha_npu_wlan_set_cmd func_id,
 				    void *data, int data_len, gfp_t gfp)
@@ -639,7 +654,7 @@ static int airoha_npu_wlan_msg_send(struct airoha_npu *npu, int ifindex,
 
 	if (func_id < 0 || func_id >= WLAN_FUNC_SET_WAIT_MAX)
 		return -EINVAL;
-	if (npu->soc_data->wlan_func_set[func_id] == WLAN_FUNC_SET_WAIT_MAX)
+	if (!airoha_npu_wlan_cmd_supported(npu, true, func_id))
 		return -EOPNOTSUPP;
 	func_id = npu->soc_data->wlan_func_set[func_id];
 
@@ -668,7 +683,7 @@ static int airoha_npu_wlan_msg_get(struct airoha_npu *npu, int ifindex,
 
 	if (func_id < 0 || func_id >= WLAN_FUNC_GET_WAIT_MAX)
 		return -EINVAL;
-	if (npu->soc_data->wlan_func_get[func_id] == WLAN_FUNC_GET_WAIT_MAX)
+	if (!airoha_npu_wlan_cmd_supported(npu, false, func_id))
 		return -EOPNOTSUPP;
 	func_id = npu->soc_data->wlan_func_get[func_id];
 
@@ -1820,6 +1835,11 @@ static const struct airoha_npu_soc_data an7583_npu_soc_data = {
 };
 
 static const struct of_device_id of_airoha_npu_match[] = {
+	{ .compatible = "airoha,en7523-npu", .data = &en7523_npu_soc_data },
+	{ .compatible = "airoha,en7581-npu", .data = &en7581_npu_soc_data },
+	{ .compatible = "airoha,an7581-npu", .data = &en7581_npu_soc_data },
+	{ .compatible = "airoha,an7583-npu", .data = &an7583_npu_soc_data },
+	{ .compatible = "airoha,an7552-npu", .data = &an7552_npu_soc_data },
 	{ .compatible = "airoha,airoha_en7523-npu", .data = &en7523_npu_soc_data },
 	{ .compatible = "airoha,airoha_en7581-npu", .data = &en7581_npu_soc_data },
 	{ .compatible = "airoha,airoha_an7583-npu", .data = &an7583_npu_soc_data },
@@ -1849,7 +1869,8 @@ static int airoha_npu_probe_cpu_cores(struct airoha_npu *npu)
 		goto out_unlock;
 	}
 
-	err = airoha_npu_run_firmware(npu->dev, priv->base, priv->fw_addr);
+	err = airoha_npu_run_firmware(npu->dev, priv->base, priv->fw_addr,
+				      priv->rmem->size);
 	if (err) {
 		if (err != -EPROBE_DEFER)
 			dev_err(npu->dev, "failed to run npu firmware: %d\n", err);
@@ -1995,6 +2016,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
 	npu->ops.ppe_init_stats = airoha_npu_ppe_stats_setup;
 	npu->ops.ppe_flush_sram_entries = airoha_npu_ppe_flush_sram_entries;
 	npu->ops.ppe_foe_commit_entry = airoha_npu_foe_commit_entry;
+	npu->ops.wlan_has_cmd = airoha_npu_wlan_cmd_supported;
 	npu->ops.wlan_init_reserved_memory = airoha_npu_wlan_init_memory;
 	npu->ops.wlan_send_msg = airoha_npu_wlan_msg_send;
 	npu->ops.wlan_get_msg = airoha_npu_wlan_msg_get;
@@ -2061,10 +2083,10 @@ static int airoha_npu_probe(struct platform_device *pdev)
 		return err;
 
 	/*
-	 * Prepare the coherent mailbox buffers before the delayed firmware start.
-	 * Only NPU v2 exposes per-core watchdog IRQs.
+	 * Every core needs a mailbox buffer, including v1 cores without a
+	 * watchdog IRQ. Watchdog routing is a separate SoC capability.
 	 */
-	for (i = 0; i < npu->soc_data->watchdogs; i++) {
+	for (i = 0; i < npu->soc_data->max_cores; i++) {
 		struct airoha_npu_core *core = &npu->cores[i];
 
 		spin_lock_init(&core->lock);
@@ -2075,9 +2097,14 @@ static int airoha_npu_probe(struct platform_device *pdev)
 						&core->addr, GFP_KERNEL);
 		if (!core->buf)
 			return -ENOMEM;
+	}
 
+	for (i = 0; i < npu->soc_data->watchdogs; i++) {
+		struct airoha_npu_core *core = &npu->cores[i];
 		char watchdog_name[16];
-		snprintf(watchdog_name, 16, NPU_WATCHDOG_INTNAME, i);
+
+		snprintf(watchdog_name, sizeof(watchdog_name),
+			 NPU_WATCHDOG_INTNAME, i);
 		irq = platform_get_irq_byname(pdev, watchdog_name);
 		if (irq < 0)
 			return dev_err_probe(dev, irq, "error on get irq to " NPU_WATCHDOG_INTNAME, i);
