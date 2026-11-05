@@ -165,8 +165,10 @@ struct airoha_npu_tx_dma_desc {
 } __packed;
 
 enum airoha_npu_version {
-	NPU_V1,
-	NPU_V2,
+	NPU_V1 = 1, /* EN7523 */
+	NPU_V2,     /* AN7581 */
+	NPU_V2_S,   /* AN7552 */
+	NPU_V2_P,   /* AN7583 */
 };
 
 enum airoha_npu_wlan_set_cmd {

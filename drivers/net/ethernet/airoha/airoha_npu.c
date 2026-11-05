@@ -41,14 +41,22 @@
  * WLAN TLV messages (header + payload); largest in-tree WLAN payload today
  * is 16 bytes (INODE_TXRX_REG_ADDR). Keep headroom for future commands.
  */
-#define AIROHA_NPU_MBOX_SIZE			256
+#define AIROHA_NPU_MBOX_SIZE		256
 
 #define REG_NPU_LOCAL_SRAM		0x0
 
-#define REG_PC_DBG(_soc, _n)		((_soc)->pc_base_addr + ((_n) * 0x100))
-#define REG_CR_BOOT_TRIGGER(_soc)	((_soc)->cluster_base_addr + 0x000)
-#define REG_CR_BOOT_CONFIG(_soc)	((_soc)->cluster_base_addr + 0x004)
-#define REG_CR_BOOT_BASE(_soc, _n)	((_soc)->cluster_base_addr + 0x020 + ((_n) << 2))
+#define V1_NPU_CLUSTER_BASE		0x308000
+#define V2_NPU_CLUSTER_BASE		0x306000
+#define V1_CR_PC_BASE_ADDR		(V1_NPU_CLUSTER_BASE + 0x800)
+#define V2_CR_PC_BASE_ADDR		0x305000
+
+#define NPU_CLUSTER_BASE(_SOC)		((_SOC)->version == NPU_V1 ? V1_NPU_CLUSTER_BASE : V2_NPU_CLUSTER_BASE)
+#define CR_PC_BASE_ADDR(_SOC)		((_SOC)->version == NPU_V1 ? V1_CR_PC_BASE_ADDR : V2_CR_PC_BASE_ADDR)
+
+#define REG_PC_DBG(_SOC, _n)		(CR_PC_BASE_ADDR(_SOC) + ((_n) * 0x100))
+#define REG_CR_BOOT_TRIGGER(_SOC)	(NPU_CLUSTER_BASE(_SOC) + 0x000)
+#define REG_CR_BOOT_CONFIG(_SOC)	(NPU_CLUSTER_BASE(_SOC) + 0x004)
+#define REG_CR_BOOT_BASE(_SOC, _n)	(NPU_CLUSTER_BASE(_SOC) + 0x020 + ((_n) << 2))
 
 #define NPU_MBOX_BASE_ADDR		0x30c000
 
@@ -80,7 +88,28 @@
 #define REG_WDT_TIMER_CTRL(_n)		(NPU_TIMER_BASE_ADDR + ((_n) * 0x100))
 #define WDT_EN_MASK			BIT(25)
 #define WDT_INTR_MASK			BIT(21)
-#define AN7552_WDT_TIMER_EN_MASK	0x1e0001ef
+
+#define AN7552_WDT_TIMER_EN_MASK	0x1e0001ef /* keep enable_bits (4 cntTimers + 4 wdogTimers) */
+#define AN7581_WDT_TIMER_EN_MASK	0x2000027  /* keep enable_bits (3 cntTimers + 1 wdogTimer) */
+#define EN7523_WDT_TIMER_EN_MASK	0x2000027  /* keep enable_bits (3 cntTimers + 1 wdogTimer) */
+
+#define EN7523_CSR_REG_NUM		12
+#define AN7581_CSR_REG_NUM		3
+#define AN7552_CSR_REG_NUM		3
+
+#define V1_CSR_PC_BASE_ADDR		0x1ec08800
+#define V2_CSR_PC_BASE_ADDR		0x1ec05000
+
+#define EN7523_NPU_CORES		4
+#define AN7552_NPU_CORES		2
+#define AN7583_NPU_CORES		6
+#define AN7581_NPU_CORES		8
+#define MAX_NPU_CORES(_SOC)		((_SOC)->version == NPU_V2 ?   AN7581_NPU_CORES : \
+					 (_SOC)->version == NPU_V2_S ? AN7552_NPU_CORES : \
+					 (_SOC)->version == NPU_V2_P ? AN7583_NPU_CORES : \
+								       EN7523_NPU_CORES)
+
+#define STATIC_L2C_SRAM_SIZE(_SOC)	((_SOC)->version == NPU_V2 ? SZ_256K : SZ_128K)
 
 enum {
 	NPU_OP_SET = 1,
@@ -130,13 +159,10 @@ struct airoha_npu_fw {
 
 struct airoha_npu_soc_data {
 	enum airoha_npu_version version;
-	int max_cores;
-	int cluster_base_addr;
-	int pc_base_addr;
+
 	u32 mbox_func_mask;
-	int wdt_irq_base;
 	bool shared_wdt;
-	u16 watchdogs;
+	bool have_wdt;
 
 	struct airoha_npu_fw fw_rv32;
 	struct airoha_npu_fw fw_data;
@@ -281,7 +307,7 @@ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
 	u32 val, offset = 0;
 	int ret;
 
-	if (len > AIROHA_NPU_MBOX_SIZE)
+	if (len < 0 || len > AIROHA_NPU_MBOX_SIZE)
 		return -EINVAL;
 
 	if (reply && reply_len > len)
@@ -293,6 +319,10 @@ static int __airoha_npu_send_msg(struct airoha_npu *npu, int func_id,
 
 	if (npu->soc_data->version == NPU_V1 && func_id > NPU_FUNC_TR471)
 		return -EOPNOTSUPP;
+
+	/* A mailbox request requires a coherent payload buffer. */
+	if (!core->buf)
+		return -ENODEV;
 
 	airoha_npu_debugfs_count(npu, AIROHA_NPU_DBG_MBOX_REQUESTS);
 
@@ -835,7 +865,7 @@ static int airoha_npu_debugfs_status_show(struct seq_file *m, void *private)
 
 	seq_printf(m, "device: %s\n", dev_name(npu->dev));
 	seq_printf(m, "npu_interface: v%u\n", npu->soc_data->version + 1);
-	seq_printf(m, "cores: %d\n", npu->soc_data->max_cores);
+	seq_printf(m, "cores: %d\n", MAX_NPU_CORES(npu->soc_data));
 	if (dbg->fw_version_valid)
 		seq_printf(m, "firmware: v%u.%u (0x%08x)\n",
 			   dbg->fw_version >> 16, dbg->fw_version & 0xffff,
@@ -943,7 +973,7 @@ static int airoha_npu_debugfs_registers_show(struct seq_file *m,
 				      REG_CR_BOOT_TRIGGER(npu->soc_data));
 	airoha_npu_debugfs_print_reg(m, npu, "BOOT_CONFIG",
 				      REG_CR_BOOT_CONFIG(npu->soc_data));
-	for (i = 0; i < npu->soc_data->max_cores; i++) {
+	for (i = 0; i < MAX_NPU_CORES(npu->soc_data); i++) {
 		snprintf(name, sizeof(name), "CORE%d_BOOT_BASE", i);
 		airoha_npu_debugfs_print_reg(m, npu, name,
 					      REG_CR_BOOT_BASE(npu->soc_data, i));
@@ -1179,7 +1209,7 @@ static int airoha_npu_debugfs_json_show(struct seq_file *m, void *private)
 	airoha_npu_debugfs_json_string(m, dev_name(npu->dev));
 	seq_printf(m, ",\n  \"interface\": {\"version\": %u, "
 		   "\"cores\": %d},\n  \"firmware\": ",
-		   npu->soc_data->version + 1, npu->soc_data->max_cores);
+		   npu->soc_data->version + 1, MAX_NPU_CORES(npu->soc_data));
 	if (dbg->fw_version_valid)
 		seq_printf(m, "{\"major\": %u, \"minor\": %u, "
 			   "\"raw\": %u, \"raw_hex\": \"0x%08x\"}",
@@ -1287,7 +1317,7 @@ static int airoha_npu_debugfs_json_show(struct seq_file *m, void *private)
 				    REG_CR_BOOT_TRIGGER(npu->soc_data), &first);
 	airoha_npu_debugfs_json_reg(m, npu, "BOOT_CONFIG",
 				    REG_CR_BOOT_CONFIG(npu->soc_data), &first);
-	for (i = 0; i < npu->soc_data->max_cores; i++) {
+	for (i = 0; i < MAX_NPU_CORES(npu->soc_data); i++) {
 		snprintf(name, sizeof(name), "CORE%d_BOOT_BASE", i);
 		airoha_npu_debugfs_json_reg(m, npu, name,
 					    REG_CR_BOOT_BASE(npu->soc_data, i),
@@ -1510,7 +1540,7 @@ static void airoha_boot_core_v1(struct airoha_npu *npu,
 	int core;
 
 	/* setting booting address */
-	for (core = 0; core < npu->soc_data->max_cores; core++) {
+	for (core = 0; core < MAX_NPU_CORES(npu->soc_data); core++) {
 		regmap_write(npu->regmap, REG_CR_BOOT_BASE(npu->soc_data, core), rmem->base);
 		usleep_range(1000, 2000);
 
@@ -1535,13 +1565,13 @@ static void airoha_boot_core_v2(struct airoha_npu *npu,
 	int i;
 
 	/* setting booting address */
-	for (i = 0; i < npu->soc_data->max_cores; i++)
+	for (i = 0; i < MAX_NPU_CORES(npu->soc_data); i++)
 		regmap_write(npu->regmap, REG_CR_BOOT_BASE(npu->soc_data, i), rmem->base);
 	usleep_range(1000, 2000);
 
 	/* enable NPU cores */
 	regmap_write(npu->regmap, REG_CR_BOOT_CONFIG(npu->soc_data),
-		     GENMASK(npu->soc_data->max_cores - 1, 0));
+		     GENMASK(MAX_NPU_CORES(npu->soc_data) - 1, 0));
 	regmap_write(npu->regmap, REG_CR_BOOT_TRIGGER(npu->soc_data), 0x1);
 	msleep(100);
 }
@@ -1562,292 +1592,6 @@ static int sram_size_of_l2c(struct regmap *scuclk)
 	return val;
 }
 
-static const struct airoha_npu_soc_data en7523_npu_soc_data = {
-	.version = NPU_V1,
-	.max_cores = 4,
-	.cluster_base_addr = 0x308000,
-	.pc_base_addr = 0x308800,
-	.boot_core = airoha_boot_core_v1,
-	.shared_wdt = false,
-	.watchdogs = 0,
-	.fw_rv32 = {
-		.name = NPU_EN7523_FIRMWARE_RV32,
-		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
-	},
-	.fw_data = {
-		.name = NPU_EN7523_FIRMWARE_DATA,
-		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
-	},
-	.wlan_func_get = {
-		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
-		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
-		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
-		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
-		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
-		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
-
-		/* Not implemented by the EN7523 V1.001/V1.002 firmware. */
-		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = WLAN_FUNC_GET_WAIT_MAX,
-		[WLAN_FUNC_GET_WAIT_RING_SIZE] = WLAN_FUNC_GET_WAIT_MAX,
-		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = WLAN_FUNC_GET_WAIT_MAX,
-		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = WLAN_FUNC_GET_WAIT_MAX,
-		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = WLAN_FUNC_GET_WAIT_MAX,
-	},
-	.wlan_func_set = {
-		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
-		[WLAN_FUNC_SET_WAIT_DESC] = 1,
-		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
-		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
-		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
-		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
-		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
-		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
-		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
-		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
-		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
-		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
-		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
-		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
-		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
-		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
-		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
-		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
-		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
-		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
-
-		/* Not implemented by the EN7523 V1.001/V1.002 firmware. */
-		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = WLAN_FUNC_SET_WAIT_MAX,
-	},
-};
-
-static const struct airoha_npu_soc_data an7552_npu_soc_data = {
-	.version = NPU_V2,
-	.max_cores = 2,
-	.cluster_base_addr = 0x306000,
-	.pc_base_addr = 0x305000,
-	.mbox_func_mask = GENMASK(NPU_FUNC_NOTIFY, NPU_FUNC_WIFI),
-	.wdt_irq_base = 7,
-	.shared_wdt = true,
-	.watchdogs = 2,
-	.boot_core = airoha_boot_core_v2,
-	.fw_rv32 = {
-		.name = NPU_AN7552_FIRMWARE_RV32,
-		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
-	},
-	.fw_data = {
-		.name = NPU_AN7552_FIRMWARE_DATA,
-		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
-	},
-	.wlan_func_get = {
-		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
-		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
-		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
-		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
-		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
-		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
-		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = 6,
-		[WLAN_FUNC_GET_WAIT_RING_SIZE] = 7,
-		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = WLAN_FUNC_GET_WAIT_MAX,
-		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = WLAN_FUNC_GET_WAIT_MAX,
-		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = WLAN_FUNC_GET_WAIT_MAX,
-	},
-	.wlan_func_set = {
-		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
-		[WLAN_FUNC_SET_WAIT_DESC] = 1,
-		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
-		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = 3,
-		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
-		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
-		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
-		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
-		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
-		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
-		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
-		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
-		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
-		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
-		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
-		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
-		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
-		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
-		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
-		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
-		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
-		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = 22,
-		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = 23,
-		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = 24,
-		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = 25,
-		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = 26,
-		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = 27,
-		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = 28,
-		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
-		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = WLAN_FUNC_SET_WAIT_MAX,
-	},
-};
-
-static const struct airoha_npu_soc_data en7581_npu_soc_data = {
-	.version = NPU_V2,
-	.max_cores = 8,
-	.cluster_base_addr = 0x306000,
-	.pc_base_addr = 0x305000,
-	.boot_core = airoha_boot_core_v2,
-	.watchdogs = 8,
-	.fw_rv32 = {
-		.name = NPU_EN7581_FIRMWARE_RV32,
-		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
-	},
-	.fw_data = {
-		.name = NPU_EN7581_FIRMWARE_DATA,
-		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
-	},
-	.wlan_func_get = {
-		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
-		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
-		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
-		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
-		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
-		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
-		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = 6,
-		[WLAN_FUNC_GET_WAIT_RING_SIZE] = 7,
-		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = 8,
-		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = 9,
-		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = 10,
-	},
-	.wlan_func_set = {
-		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
-		[WLAN_FUNC_SET_WAIT_DESC] = 1,
-		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
-		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = 3,
-		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
-		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
-		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
-		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
-		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
-		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
-		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
-		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
-		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
-		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
-		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
-		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
-		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
-		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
-		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
-		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
-		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
-		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = 22,
-		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = 23,
-		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = 24,
-		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = 25,
-		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = 26,
-		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = 27,
-		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = 28,
-		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = 29,
-		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = 30,
-		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = 31,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = 32,
-		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = 33,
-	},
-};
-
-static const struct airoha_npu_soc_data an7583_npu_soc_data = {
-	.version = NPU_V2,
-	.max_cores = 8,
-	.cluster_base_addr = 0x306000,
-	.pc_base_addr = 0x305000,
-	.boot_core = airoha_boot_core_v2,
-	.watchdogs = 8,
-	.fw_rv32 = {
-		.name = NPU_AN7583_FIRMWARE_RV32,
-		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
-	},
-	.fw_data = {
-		.name = NPU_AN7583_FIRMWARE_DATA,
-		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
-	},
-	.wlan_func_get = {
-		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
-		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
-		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
-		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
-		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
-		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
-		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = 6,
-		[WLAN_FUNC_GET_WAIT_RING_SIZE] = 7,
-		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = 8,
-		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = 9,
-		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = 10,
-	},
-	.wlan_func_set = {
-		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
-		[WLAN_FUNC_SET_WAIT_DESC] = 1,
-		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
-		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = 3,
-		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
-		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
-		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
-		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
-		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
-		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
-		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
-		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
-		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
-		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
-		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
-		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
-		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
-		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
-		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
-		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
-		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
-		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = 22,
-		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = 23,
-		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = 24,
-		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = 25,
-		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = 26,
-		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = 27,
-		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = 28,
-		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = 29,
-		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = 30,
-		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = 31,
-		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = 32,
-		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = 33,
-	},
-};
-
-static const struct of_device_id of_airoha_npu_match[] = {
-	{ .compatible = "airoha,en7523-npu", .data = &en7523_npu_soc_data },
-	{ .compatible = "airoha,en7581-npu", .data = &en7581_npu_soc_data },
-	{ .compatible = "airoha,an7581-npu", .data = &en7581_npu_soc_data },
-	{ .compatible = "airoha,an7583-npu", .data = &an7583_npu_soc_data },
-	{ .compatible = "airoha,an7552-npu", .data = &an7552_npu_soc_data },
-	{ .compatible = "airoha,airoha_en7523-npu", .data = &en7523_npu_soc_data },
-	{ .compatible = "airoha,airoha_en7581-npu", .data = &en7581_npu_soc_data },
-	{ .compatible = "airoha,airoha_an7583-npu", .data = &an7583_npu_soc_data },
-	{ .compatible = "airoha,airoha_an7552-npu", .data = &an7552_npu_soc_data },
-	{ /* sentinel */ }
-};
-MODULE_DEVICE_TABLE(of, of_airoha_npu_match);
-
 static const struct regmap_config regmap_config = {
 	.name			= "npu",
 	.reg_bits		= 32,
@@ -1861,7 +1605,7 @@ static int airoha_npu_probe_cpu_cores(struct airoha_npu *npu)
 	struct airoha_npu_priv *priv = airoha_npu_to_priv(npu);
 	bool npu_version_valid = false;
 	u32 npu_version = 0;
-	int err;
+	int err, l2c_size;
 
 	mutex_lock(&priv->start_lock);
 	if (priv->started) {
@@ -1877,11 +1621,16 @@ static int airoha_npu_probe_cpu_cores(struct airoha_npu *npu)
 		goto out_unlock;
 	}
 
+	l2c_size = sram_size_of_l2c(npu->scu_regmap);
+	if (STATIC_L2C_SRAM_SIZE(npu->soc_data) == l2c_size)
+		dev_warn(npu->dev, "current L2C size mismatch (0x%06x != 0x%06x)",
+			 STATIC_L2C_SRAM_SIZE(npu->soc_data), l2c_size);
+	
 	/* Set the information consumed by the NPU firmware before booting it. */
 	regmap_write(npu->regmap, REG_CR_NPU_MIB(10),
 		     (u32)priv->rmem->base + npu->soc_data->fw_rv32.max_size);
 	regmap_write(npu->regmap, REG_CR_NPU_MIB(11),
-		     sram_size_of_l2c(npu->scu_regmap));
+		     l2c_size);
 	regmap_write(npu->regmap, REG_CR_NPU_MIB(12),
 		     is_fpga(npu->scu_regmap));
 	regmap_write(npu->regmap, REG_CR_NPU_MIB(21),
@@ -2053,7 +1802,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
 	if (IS_ERR(npu->scu_regmap))
 		return PTR_ERR(npu->scu_regmap);
 
-	npu->cores = devm_kcalloc(dev, npu->soc_data->max_cores,
+	npu->cores = devm_kcalloc(dev, MAX_NPU_CORES(npu->soc_data),
 				  sizeof(*npu->cores), GFP_KERNEL);
 	if (!npu->cores)
 		return -ENOMEM;
@@ -2086,7 +1835,7 @@ static int airoha_npu_probe(struct platform_device *pdev)
 	 * Every core needs a mailbox buffer, including v1 cores without a
 	 * watchdog IRQ. Watchdog routing is a separate SoC capability.
 	 */
-	for (i = 0; i < npu->soc_data->max_cores; i++) {
+	for (i = 0; i < MAX_NPU_CORES(npu->soc_data); i++) {
 		struct airoha_npu_core *core = &npu->cores[i];
 
 		spin_lock_init(&core->lock);
@@ -2097,9 +1846,11 @@ static int airoha_npu_probe(struct platform_device *pdev)
 						&core->addr, GFP_KERNEL);
 		if (!core->buf)
 			return -ENOMEM;
+
 	}
 
-	for (i = 0; i < npu->soc_data->watchdogs; i++) {
+	for (i = 0; npu->soc_data->have_wdt &&
+	     i < MAX_NPU_CORES(npu->soc_data); i++) {
 		struct airoha_npu_core *core = &npu->cores[i];
 		char watchdog_name[16];
 
@@ -2126,6 +1877,277 @@ static void airoha_npu_remove(struct platform_device *pdev)
 	struct airoha_npu *npu = platform_get_drvdata(pdev);
 	airoha_npu_debugfs_remove(npu);
 }
+
+static const struct airoha_npu_soc_data en7523_npu_soc_data = {
+	.version = NPU_V1,
+	.boot_core = airoha_boot_core_v1,
+	.shared_wdt = false,
+	.have_wdt = false,
+	.fw_rv32 = {
+		.name = NPU_EN7523_FIRMWARE_RV32,
+		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
+	},
+	.fw_data = {
+		.name = NPU_EN7523_FIRMWARE_DATA,
+		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
+	},
+	.wlan_func_get = {
+		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
+		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
+		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
+		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
+		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
+		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
+
+		/* Not implemented by the EN7523 V1.001/V1.002 firmware. */
+		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = WLAN_FUNC_GET_WAIT_MAX,
+		[WLAN_FUNC_GET_WAIT_RING_SIZE] = WLAN_FUNC_GET_WAIT_MAX,
+		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = WLAN_FUNC_GET_WAIT_MAX,
+		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = WLAN_FUNC_GET_WAIT_MAX,
+		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = WLAN_FUNC_GET_WAIT_MAX,
+	},
+	.wlan_func_set = {
+		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
+		[WLAN_FUNC_SET_WAIT_DESC] = 1,
+		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
+		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
+		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
+		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
+		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
+		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
+		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
+		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
+		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
+		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
+		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
+		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
+		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
+		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
+		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
+		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
+		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
+		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
+
+		/* Not implemented by the EN7523 V1.001/V1.002 firmware. */
+		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = WLAN_FUNC_SET_WAIT_MAX,
+	},
+};
+
+static const struct airoha_npu_soc_data an7552_npu_soc_data = {
+	.version = NPU_V2_S,
+	.mbox_func_mask = GENMASK(NPU_FUNC_NOTIFY, NPU_FUNC_WIFI),
+	.shared_wdt = true,
+	.have_wdt = true,
+	.boot_core = airoha_boot_core_v2,
+	.fw_rv32 = {
+		.name = NPU_AN7552_FIRMWARE_RV32,
+		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
+	},
+	.fw_data = {
+		.name = NPU_AN7552_FIRMWARE_DATA,
+		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
+	},
+	.wlan_func_get = {
+		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
+		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
+		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
+		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
+		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
+		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
+		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = 6,
+		[WLAN_FUNC_GET_WAIT_RING_SIZE] = 7,
+		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = WLAN_FUNC_GET_WAIT_MAX,
+		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = WLAN_FUNC_GET_WAIT_MAX,
+		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = WLAN_FUNC_GET_WAIT_MAX,
+	},
+	.wlan_func_set = {
+		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
+		[WLAN_FUNC_SET_WAIT_DESC] = 1,
+		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
+		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = 3,
+		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
+		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
+		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
+		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
+		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
+		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
+		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
+		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
+		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
+		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
+		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
+		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
+		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
+		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
+		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
+		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
+		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
+		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = 22,
+		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = 23,
+		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = 24,
+		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = 25,
+		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = 26,
+		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = 27,
+		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = 28,
+		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = WLAN_FUNC_SET_WAIT_MAX,
+		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = WLAN_FUNC_SET_WAIT_MAX,
+	},
+};
+
+static const struct airoha_npu_soc_data en7581_npu_soc_data = {
+	.version = NPU_V2,
+	.shared_wdt = false,
+	.have_wdt = true,
+	.boot_core = airoha_boot_core_v2,
+	.fw_rv32 = {
+		.name = NPU_EN7581_FIRMWARE_RV32,
+		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
+	},
+	.fw_data = {
+		.name = NPU_EN7581_FIRMWARE_DATA,
+		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
+	},
+	.wlan_func_get = {
+		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
+		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
+		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
+		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
+		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
+		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
+		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = 6,
+		[WLAN_FUNC_GET_WAIT_RING_SIZE] = 7,
+		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = 8,
+		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = 9,
+		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = 10,
+	},
+	.wlan_func_set = {
+		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
+		[WLAN_FUNC_SET_WAIT_DESC] = 1,
+		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
+		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = 3,
+		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
+		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
+		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
+		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
+		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
+		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
+		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
+		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
+		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
+		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
+		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
+		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
+		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
+		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
+		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
+		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
+		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
+		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = 22,
+		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = 23,
+		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = 24,
+		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = 25,
+		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = 26,
+		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = 27,
+		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = 28,
+		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = 29,
+		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = 30,
+		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = 31,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = 32,
+		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = 33,
+	},
+};
+
+static const struct airoha_npu_soc_data an7583_npu_soc_data = {
+	.version = NPU_V2_P,
+	.shared_wdt = false,
+	.have_wdt = true,
+	.boot_core = airoha_boot_core_v2,
+	.fw_rv32 = {
+		.name = NPU_AN7583_FIRMWARE_RV32,
+		.max_size = NPU_EN7581_FIRMWARE_RV32_MAX_SIZE,
+	},
+	.fw_data = {
+		.name = NPU_AN7583_FIRMWARE_DATA,
+		.max_size = NPU_EN7581_FIRMWARE_DATA_MAX_SIZE,
+	},
+	.wlan_func_get = {
+		[WLAN_FUNC_GET_WAIT_NPU_INFO] = 0,
+		[WLAN_FUNC_GET_WAIT_LAST_RATE] = 1,
+		[WLAN_FUNC_GET_WAIT_COUNTER] = 2,
+		[WLAN_FUNC_GET_WAIT_DBG_COUNTER] = 3,
+		[WLAN_FUNC_GET_WAIT_RXDESC_BASE] = 4,
+		[WLAN_FUNC_GET_WAIT_WCID_DBG_COUNTER] = 5,
+		[WLAN_FUNC_GET_WAIT_DMA_ADDR] = 6,
+		[WLAN_FUNC_GET_WAIT_RING_SIZE] = 7,
+		[WLAN_FUNC_GET_WAIT_NPU_SUPPORT_MAP] = 8,
+		[WLAN_FUNC_GET_WAIT_MDC_LOCK_ADDRESS] = 9,
+		[WLAN_FUNC_GET_WAIT_NPU_VERSION] = 10,
+	},
+	.wlan_func_set = {
+		[WLAN_FUNC_SET_WAIT_PCIE_ADDR] = 0,
+		[WLAN_FUNC_SET_WAIT_DESC] = 1,
+		[WLAN_FUNC_SET_WAIT_NPU_INIT_DONE] = 2,
+		[WLAN_FUNC_SET_WAIT_TRAN_TO_CPU] = 3,
+		[WLAN_FUNC_SET_WAIT_BA_WIN_SIZE] = 4,
+		[WLAN_FUNC_SET_WAIT_DRIVER_MODEL] = 5,
+		[WLAN_FUNC_SET_WAIT_DEL_STA] = 6,
+		[WLAN_FUNC_SET_WAIT_DRAM_BA_NODE_ADDR] = 7,
+		[WLAN_FUNC_SET_WAIT_PKT_BUF_ADDR] = 8,
+		[WLAN_FUNC_SET_WAIT_IS_TEST_NOBA] = 9,
+		[WLAN_FUNC_SET_WAIT_FLUSHONE_TIMEOUT] = 10,
+		[WLAN_FUNC_SET_WAIT_FLUSHALL_TIMEOUT] = 11,
+		[WLAN_FUNC_SET_WAIT_IS_FORCE_TO_CPU] = 12,
+		[WLAN_FUNC_SET_WAIT_PCIE_STATE] = 13,
+		[WLAN_FUNC_SET_WAIT_PCIE_PORT_TYPE] = 14,
+		[WLAN_FUNC_SET_WAIT_ERROR_RETRY_TIMES] = 15,
+		[WLAN_FUNC_SET_WAIT_BAR_INFO] = 16,
+		[WLAN_FUNC_SET_WAIT_FAST_FLAG] = 17,
+		[WLAN_FUNC_SET_WAIT_NPU_BAND0_ONCPU] = 18,
+		[WLAN_FUNC_SET_WAIT_TX_RING_PCIE_ADDR] = 19,
+		[WLAN_FUNC_SET_WAIT_TX_DESC_HW_BASE] = 20,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_SPACE_HW_BASE] = 21,
+		[WLAN_FUNC_SET_WAIT_RX_RING_FOR_TXDONE_HW_BASE] = 22,
+		[WLAN_FUNC_SET_WAIT_TX_PKT_BUF_ADDR] = 23,
+		[WLAN_FUNC_SET_WAIT_INODE_TXRX_REG_ADDR] = 24,
+		[WLAN_FUNC_SET_WAIT_INODE_DEBUG_FLAG] = 25,
+		[WLAN_FUNC_SET_WAIT_INODE_HW_CFG_INFO] = 26,
+		[WLAN_FUNC_SET_WAIT_INODE_STOP_ACTION] = 27,
+		[WLAN_FUNC_SET_WAIT_INODE_PCIE_SWAP] = 28,
+		[WLAN_FUNC_SET_WAIT_RATELIMIT_CTRL] = 29,
+		[WLAN_FUNC_SET_WAIT_HWNAT_INIT] = 30,
+		[WLAN_FUNC_SET_WAIT_ARHT_CHIP_INFO] = 31,
+		[WLAN_FUNC_SET_WAIT_TX_BUF_CHECK_ADDR] = 32,
+		[WLAN_FUNC_SET_WAIT_TOKEN_ID_SIZE] = 33,
+	},
+};
+
+static const struct of_device_id of_airoha_npu_match[] = {
+	{ .compatible = "airoha,en7523-npu", .data = &en7523_npu_soc_data },
+	{ .compatible = "airoha,en7581-npu", .data = &en7581_npu_soc_data },
+	{ .compatible = "airoha,an7581-npu", .data = &en7581_npu_soc_data },
+	{ .compatible = "airoha,an7583-npu", .data = &an7583_npu_soc_data },
+	{ .compatible = "airoha,an7552-npu", .data = &an7552_npu_soc_data },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, of_airoha_npu_match);
 
 static struct platform_driver airoha_npu_driver = {
 	.probe = airoha_npu_probe,
