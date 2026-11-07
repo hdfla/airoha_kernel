@@ -3657,9 +3657,11 @@ static int airoha_qdma_modern_hw_init(struct airoha_qdma *qdma)
 		airoha_qdma_irq_enable(&qdma->irq_banks[i], QDMA_INT_REG_IDX3,
 				       INT_RX3_MASK(RX_IRQ_BANK_PIN_MASK(i)));
 	}
-	/* setup tx irqs */
+	/* setup tx irqs, TX IRQ queue 1 stays with the NPU on EN7523 */
 	airoha_qdma_irq_enable(&qdma->irq_banks[0], QDMA_INT_REG_IDX0,
-			       TX_COHERENT_LOW_INT_MASK | INT_TX_MASK);
+			       TX_COHERENT_LOW_INT_MASK |
+			       (airoha_qdma_npu_owns_txq(qdma) ?
+				TX_DONE_INT_MASK(0) : INT_TX_MASK));
 	if (!compact_irq)
 		airoha_qdma_irq_enable(&qdma->irq_banks[0], QDMA_INT_REG_IDX4,
 				       TX_COHERENT_HIGH_INT_MASK);
