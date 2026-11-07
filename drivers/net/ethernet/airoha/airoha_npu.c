@@ -1821,6 +1821,8 @@ static const struct airoha_npu_soc_data an7583_npu_soc_data = {
 
 static const struct of_device_id of_airoha_npu_match[] = {
 	{ .compatible = "airoha,airoha_en7523-npu", .data = &en7523_npu_soc_data },
+	/* Note: the EN7523 device tree still uses the old name. */
+	{ .compatible = "airoha,en7523-npu", .data = &en7523_npu_soc_data },
 	{ .compatible = "airoha,airoha_en7581-npu", .data = &en7581_npu_soc_data },
 	{ .compatible = "airoha,airoha_an7583-npu", .data = &an7583_npu_soc_data },
 	{ .compatible = "airoha,airoha_an7552-npu", .data = &an7552_npu_soc_data },
